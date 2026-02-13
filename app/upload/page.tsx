@@ -90,6 +90,10 @@ function normalizeDescription(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+function isBeginningBalanceRow(description: string): boolean {
+  return /beginning\s+balance/i.test(description.trim());
+}
+
 async function sha256Hex(input: string): Promise<string> {
   const encoded = new TextEncoder().encode(input);
   const hashBuffer = await crypto.subtle.digest("SHA-256", encoded);
@@ -216,6 +220,13 @@ export default function UploadPage() {
     preview.rows.forEach((row, rowIndex) => {
       const dateValue = row[dateIndex] ?? "";
       const amountValue = row[amountIndex] ?? "";
+      const descriptionIndex =
+        columnMapping.description.length > 0 ? preview.headers.indexOf(columnMapping.description) : -1;
+      const descriptionValue = descriptionIndex >= 0 ? (row[descriptionIndex] ?? "") : "";
+
+      if (isBeginningBalanceRow(descriptionValue)) {
+        return;
+      }
 
       if (!parseMDYDateToISO(dateValue)) {
         invalidDateRows.push(rowIndex + 1);
@@ -227,7 +238,7 @@ export default function UploadPage() {
     });
 
     return { invalidDateRows, invalidAmountRows };
-  }, [columnMapping.amount, columnMapping.date, preview]);
+  }, [columnMapping.amount, columnMapping.date, columnMapping.description, preview]);
 
   const mappingPayload = {
     required: {
@@ -274,7 +285,7 @@ export default function UploadPage() {
         const amountRaw = row[amountIndex] ?? "";
         const descriptionRaw = (row[descriptionIndex] ?? "").trim();
 
-        if (!amountRaw.trim() || /beginning\s+balance/i.test(descriptionRaw)) {
+        if (!amountRaw.trim() || isBeginningBalanceRow(descriptionRaw)) {
           skippedInvalidCount += 1;
           continue;
         }
