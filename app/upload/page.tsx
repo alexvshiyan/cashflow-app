@@ -9,6 +9,12 @@ type UploadResponse = {
   headers: string[];
   rows: string[][];
   rowCount: number;
+  detection: {
+    institution: Institution;
+    accountType: AccountType;
+    accountId: string;
+    accountName: string;
+  };
 };
 
 type MappingField = "date" | "amount" | "description" | "bankCategory";
@@ -19,6 +25,8 @@ type CanonicalTransaction = {
   institution: Institution;
   source: "csv";
   accountType: AccountType;
+  accountId: string;
+  accountName: string;
   postedDateISO: string;
   amountNumber: number;
   description: string;
@@ -90,6 +98,10 @@ function normalizeDescription(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+function isBeginningBalanceRow(description: string): boolean {
+  return /beginning\s+balance/i.test(description.trim());
+}
+
 async function sha256Hex(input: string): Promise<string> {
   const encoded = new TextEncoder().encode(input);
   const hashBuffer = await crypto.subtle.digest("SHA-256", encoded);
@@ -103,8 +115,6 @@ export default function UploadPage() {
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [selectedFileName, setSelectedFileName] = useState<string | null>(null);
-  const [institution, setInstitution] = useState<Institution>("boa");
-  const [accountType, setAccountType] = useState<AccountType>("checking");
   const [columnMapping, setColumnMapping] = useState<Record<MappingField, string>>({
     date: "",
     amount: "",
@@ -216,6 +226,13 @@ export default function UploadPage() {
     preview.rows.forEach((row, rowIndex) => {
       const dateValue = row[dateIndex] ?? "";
       const amountValue = row[amountIndex] ?? "";
+      const descriptionIndex =
+        columnMapping.description.length > 0 ? preview.headers.indexOf(columnMapping.description) : -1;
+      const descriptionValue = descriptionIndex >= 0 ? (row[descriptionIndex] ?? "") : "";
+
+      if (isBeginningBalanceRow(descriptionValue)) {
+        return;
+      }
 
       if (!parseMDYDateToISO(dateValue)) {
         invalidDateRows.push(rowIndex + 1);
@@ -227,7 +244,7 @@ export default function UploadPage() {
     });
 
     return { invalidDateRows, invalidAmountRows };
-  }, [columnMapping.amount, columnMapping.date, preview]);
+  }, [columnMapping.amount, columnMapping.date, columnMapping.description, preview]);
 
   const mappingPayload = {
     required: {
@@ -255,7 +272,7 @@ export default function UploadPage() {
         ? preview.headers.indexOf(columnMapping.bankCategory)
         : -1;
       const sourceRefIndex =
-        institution === "boa" && accountType === "credit_card"
+        preview.detection.institution === "boa" && preview.detection.accountType === "credit_card"
           ? preview.headers.findIndex((header) => normalizeHeaderName(header) === "reference number")
           : -1;
 
@@ -265,7 +282,7 @@ export default function UploadPage() {
       }
 
       const userId = "mvp-user";
-      const accountId = `${institution}-${accountType}`;
+      const accountId = preview.detection.accountId;
 
       const canonical: CanonicalTransaction[] = [];
       let skippedInvalidCount = 0;
@@ -274,7 +291,7 @@ export default function UploadPage() {
         const amountRaw = row[amountIndex] ?? "";
         const descriptionRaw = (row[descriptionIndex] ?? "").trim();
 
-        if (!amountRaw.trim() || /beginning\s+balance/i.test(descriptionRaw)) {
+        if (!amountRaw.trim() || isBeginningBalanceRow(descriptionRaw)) {
           skippedInvalidCount += 1;
           continue;
         }
@@ -293,9 +310,11 @@ export default function UploadPage() {
         const fingerprint = await sha256Hex(fingerprintInput);
 
         const tx: CanonicalTransaction = {
-          institution,
+          institution: preview.detection.institution,
           source: "csv",
-          accountType,
+          accountType: preview.detection.accountType,
+          accountId: preview.detection.accountId,
+          accountName: preview.detection.accountName,
           postedDateISO,
           amountNumber,
           description: descriptionRaw,
@@ -334,29 +353,6 @@ export default function UploadPage() {
         className="flex flex-col gap-4 rounded border p-4"
       >
         <label className="flex flex-col gap-2">
-          <span className="text-sm">Institution</span>
-          <select
-            className="rounded border px-2 py-2"
-            value={institution}
-            onChange={(event) => setInstitution(event.target.value as Institution)}
-          >
-            <option value="boa">Bank of America</option>
-            <option value="chase">Chase</option>
-          </select>
-        </label>
-        <label className="flex flex-col gap-2">
-          <span className="text-sm">Account type</span>
-          <select
-            className="rounded border px-2 py-2"
-            value={accountType}
-            onChange={(event) => setAccountType(event.target.value as AccountType)}
-          >
-            <option value="checking">Checking</option>
-            <option value="savings">Savings</option>
-            <option value="credit_card">Credit card</option>
-          </select>
-        </label>
-        <label className="flex flex-col gap-2">
           <span className="text-sm">CSV file</span>
           <input
             name="file"
@@ -393,6 +389,12 @@ export default function UploadPage() {
             File: {preview.filename} | Rows shown: {preview.rowCount}
           </p>
           <p className="text-sm">Detected headers: {preview.headers.join(", ")}</p>
+          <p className="text-sm text-zinc-700">
+            Auto-detected account: {preview.detection.accountName} ({preview.detection.accountType})
+          </p>
+          <p className="text-sm text-zinc-700">
+            Auto-detected IDs: institution={preview.detection.institution}, accountId={preview.detection.accountId}
+          </p>
           <div className="overflow-x-auto rounded border">
             <table className="min-w-full border-collapse text-sm">
               <thead>
