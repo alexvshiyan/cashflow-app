@@ -12,6 +12,20 @@ type UploadResponse = {
 };
 
 type MappingField = "date" | "amount" | "description" | "bankCategory";
+type Institution = "boa" | "chase";
+type AccountType = "checking" | "savings" | "credit_card";
+
+type CanonicalTransaction = {
+  institution: Institution;
+  source: "csv";
+  accountType: AccountType;
+  postedDateISO: string;
+  amountNumber: number;
+  description: string;
+  bankCategory?: string;
+  source_ref?: string;
+  fingerprint: string;
+};
 
 const mappingFieldLabels: Record<MappingField, string> = {
   date: "Date *",
@@ -38,7 +52,7 @@ function parseAmount(value: string): number | null {
   const trimmed = value.trim();
   if (!trimmed) return null;
 
-  const isParenNegative = trimmed.startsWith("(") && trimmed.endsWith(")");
+  const isParenNegative = /^\(.*\)$/.test(trimmed);
   const sanitized = trimmed.replace(/[,$]/g, "").replace(/^\(/, "").replace(/\)$/, "");
   const parsed = Number(sanitized);
 
@@ -49,8 +63,39 @@ function parseAmount(value: string): number | null {
   return isParenNegative ? -parsed : parsed;
 }
 
-function isValidDate(value: string): boolean {
-  return Number.isFinite(Date.parse(value.trim()));
+function parseMDYDateToISO(value: string): string | null {
+  const trimmed = value.trim();
+  const match = trimmed.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!match) return null;
+
+  const month = Number(match[1]);
+  const day = Number(match[2]);
+  const year = Number(match[3]);
+
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    return null;
+  }
+
+  return date.toISOString().slice(0, 10);
+}
+
+function normalizeDescription(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const encoded = new TextEncoder().encode(input);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", encoded);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 export default function UploadPage() {
@@ -58,12 +103,21 @@ export default function UploadPage() {
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [selectedFileName, setSelectedFileName] = useState<string | null>(null);
+  const [institution, setInstitution] = useState<Institution>("boa");
+  const [accountType, setAccountType] = useState<AccountType>("checking");
   const [columnMapping, setColumnMapping] = useState<Record<MappingField, string>>({
     date: "",
     amount: "",
     description: "",
     bankCategory: "",
   });
+  const [normalizeResult, setNormalizeResult] = useState<{
+    normalized_count: number;
+    skipped_invalid_count: number;
+    preview: CanonicalTransaction[];
+  } | null>(null);
+  const [normalizeError, setNormalizeError] = useState<string | null>(null);
+
   const latestRequestRef = useRef(0);
   const formRef = useRef<HTMLFormElement>(null);
 
@@ -72,6 +126,8 @@ export default function UploadPage() {
     setSelectedFileName(file?.name ?? null);
     setError(null);
     setPreview(null);
+    setNormalizeResult(null);
+    setNormalizeError(null);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -80,6 +136,8 @@ export default function UploadPage() {
     latestRequestRef.current = requestId;
     setError(null);
     setPreview(null);
+    setNormalizeResult(null);
+    setNormalizeError(null);
     setIsSubmitting(true);
 
     try {
@@ -138,7 +196,7 @@ export default function UploadPage() {
   const hasAllRequiredMappings = requiredMappingFields.every(
     (field) => columnMapping[field].length > 0,
   );
-  const canContinue = hasAllRequiredMappings && !hasDuplicateMappings;
+  const canNormalize = hasAllRequiredMappings && !hasDuplicateMappings;
 
   const validationSummary = useMemo(() => {
     if (!preview || !columnMapping.date || !columnMapping.amount) {
@@ -159,7 +217,7 @@ export default function UploadPage() {
       const dateValue = row[dateIndex] ?? "";
       const amountValue = row[amountIndex] ?? "";
 
-      if (!isValidDate(dateValue)) {
+      if (!parseMDYDateToISO(dateValue)) {
         invalidDateRows.push(rowIndex + 1);
       }
 
@@ -182,6 +240,91 @@ export default function UploadPage() {
     },
   };
 
+  async function handleNormalize() {
+    if (!preview || !canNormalize) {
+      return;
+    }
+
+    setNormalizeError(null);
+
+    try {
+      const dateIndex = preview.headers.indexOf(columnMapping.date);
+      const amountIndex = preview.headers.indexOf(columnMapping.amount);
+      const descriptionIndex = preview.headers.indexOf(columnMapping.description);
+      const categoryIndex = columnMapping.bankCategory
+        ? preview.headers.indexOf(columnMapping.bankCategory)
+        : -1;
+      const sourceRefIndex =
+        institution === "boa" && accountType === "credit_card"
+          ? preview.headers.findIndex((header) => normalizeHeaderName(header) === "reference number")
+          : -1;
+
+      if (dateIndex < 0 || amountIndex < 0 || descriptionIndex < 0) {
+        setNormalizeError("Invalid mapping selection.");
+        return;
+      }
+
+      const userId = "mvp-user";
+      const accountId = `${institution}-${accountType}`;
+
+      const canonical: CanonicalTransaction[] = [];
+      let skippedInvalidCount = 0;
+
+      for (const row of preview.rows) {
+        const amountRaw = row[amountIndex] ?? "";
+        const descriptionRaw = (row[descriptionIndex] ?? "").trim();
+
+        if (!amountRaw.trim() || /beginning\s+balance/i.test(descriptionRaw)) {
+          skippedInvalidCount += 1;
+          continue;
+        }
+
+        const postedDateISO = parseMDYDateToISO(row[dateIndex] ?? "");
+        const amountNumber = parseAmount(amountRaw);
+
+        if (!postedDateISO || amountNumber === null || !descriptionRaw) {
+          skippedInvalidCount += 1;
+          continue;
+        }
+
+        const normalizedDescription = normalizeDescription(descriptionRaw);
+        const fingerprintInput =
+          userId + accountId + postedDateISO + String(amountNumber) + normalizedDescription;
+        const fingerprint = await sha256Hex(fingerprintInput);
+
+        const tx: CanonicalTransaction = {
+          institution,
+          source: "csv",
+          accountType,
+          postedDateISO,
+          amountNumber,
+          description: descriptionRaw,
+          fingerprint,
+        };
+
+        const bankCategoryValue = categoryIndex >= 0 ? (row[categoryIndex] ?? "").trim() : "";
+        if (bankCategoryValue) {
+          tx.bankCategory = bankCategoryValue;
+        }
+
+        const sourceRefValue = sourceRefIndex >= 0 ? (row[sourceRefIndex] ?? "").trim() : "";
+        if (sourceRefValue) {
+          tx.source_ref = sourceRefValue;
+        }
+
+        canonical.push(tx);
+      }
+
+      setNormalizeResult({
+        normalized_count: canonical.length,
+        skipped_invalid_count: skippedInvalidCount,
+        preview: canonical.slice(0, 10),
+      });
+    } catch {
+      setNormalizeError("Normalization failed.");
+    }
+  }
+
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-2xl flex-col gap-6 p-6">
       <h1 className="text-2xl font-semibold">Upload CSV</h1>
@@ -190,6 +333,29 @@ export default function UploadPage() {
         onSubmit={handleSubmit}
         className="flex flex-col gap-4 rounded border p-4"
       >
+        <label className="flex flex-col gap-2">
+          <span className="text-sm">Institution</span>
+          <select
+            className="rounded border px-2 py-2"
+            value={institution}
+            onChange={(event) => setInstitution(event.target.value as Institution)}
+          >
+            <option value="boa">Bank of America</option>
+            <option value="chase">Chase</option>
+          </select>
+        </label>
+        <label className="flex flex-col gap-2">
+          <span className="text-sm">Account type</span>
+          <select
+            className="rounded border px-2 py-2"
+            value={accountType}
+            onChange={(event) => setAccountType(event.target.value as AccountType)}
+          >
+            <option value="checking">Checking</option>
+            <option value="savings">Savings</option>
+            <option value="credit_card">Credit card</option>
+          </select>
+        </label>
         <label className="flex flex-col gap-2">
           <span className="text-sm">CSV file</span>
           <input
@@ -293,9 +459,10 @@ export default function UploadPage() {
             <button
               type="button"
               className="mt-4 rounded bg-black px-4 py-2 text-white disabled:cursor-not-allowed disabled:opacity-50"
-              disabled={!canContinue}
+              disabled={!canNormalize}
+              onClick={handleNormalize}
             >
-              Continue to normalization
+              Normalize
             </button>
 
             <p className="mt-3 text-xs text-zinc-600">Mapping payload (ready for normalization):</p>
@@ -321,6 +488,26 @@ export default function UploadPage() {
               </li>
             </ul>
           </section>
+
+          {normalizeError ? (
+            <p className="rounded border border-red-300 bg-red-50 p-3 text-sm text-red-700">
+              {normalizeError}
+            </p>
+          ) : null}
+
+          {normalizeResult ? (
+            <section className="rounded border p-4">
+              <h3 className="text-base font-medium">Normalization result</h3>
+              <ul className="mt-2 list-inside list-disc text-sm">
+                <li>normalized_count: {normalizeResult.normalized_count}</li>
+                <li>skipped_invalid_count: {normalizeResult.skipped_invalid_count}</li>
+              </ul>
+              <p className="mt-3 text-xs text-zinc-600">Canonical preview (first 10):</p>
+              <pre className="mt-1 overflow-x-auto rounded bg-zinc-100 p-2 text-xs">
+                {JSON.stringify(normalizeResult.preview, null, 2)}
+              </pre>
+            </section>
+          ) : null}
         </section>
       ) : null}
     </main>

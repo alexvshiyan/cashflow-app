@@ -50,7 +50,7 @@ Definition of Done:
 - Mapping payload shape is ready for normalization step input.
 
 ## 4. Normalize parsed rows into canonical `Transaction` model (in memory)
-Status: TODO
+Status: DONE
 
 Acceptance Criteria:
 - A canonical in-memory `Transaction` model is defined and used consistently.
