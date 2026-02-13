@@ -1,8 +1,17 @@
 import { NextResponse } from "next/server";
 
+type Institution = "boa" | "chase";
+type AccountType = "checking" | "savings" | "credit_card";
+
 type CsvPreview = {
   headers: string[];
   rows: string[][];
+  detection: {
+    institution: Institution;
+    accountType: AccountType;
+    accountId: string;
+    accountName: string;
+  };
 };
 
 const HEADER_SETS: string[][] = [
@@ -46,12 +55,12 @@ function parseCsvLine(line: string): string[] {
   return values;
 }
 
-function normalizeHeader(header: string): string {
-  return header.trim().toLowerCase();
+function normalizeCell(value: string): string {
+  return value.trim().toLowerCase();
 }
 
 function hasRequiredColumns(headers: string[]): boolean {
-  const normalized = new Set(headers.map(normalizeHeader));
+  const normalized = new Set(headers.map(normalizeCell));
   return HEADER_SETS.some((requiredSet) =>
     requiredSet.every((required) => normalized.has(required)),
   );
@@ -70,7 +79,88 @@ function detectHeaderLineIndex(lines: string[]): number {
   );
 }
 
-function parseCsvPreview(csvText: string): CsvPreview {
+function buildMetadataMap(linesBeforeHeader: string[]): Map<string, string> {
+  const metadata = new Map<string, string>();
+
+  for (const line of linesBeforeHeader) {
+    const [key, ...rest] = parseCsvLine(line);
+    const normalizedKey = normalizeCell(key ?? "");
+    const value = rest.join(",").trim();
+
+    if (normalizedKey && value) {
+      metadata.set(normalizedKey, value);
+    }
+  }
+
+  return metadata;
+}
+
+function detectInstitution(csvText: string, filename: string, metadata: Map<string, string>): Institution {
+  const metadataText = Array.from(metadata.entries())
+    .map(([key, value]) => `${key} ${value}`)
+    .join(" ");
+  const combined = `${csvText} ${filename} ${metadataText}`.toLowerCase();
+
+  if (combined.includes("chase")) {
+    return "chase";
+  }
+
+  return "boa";
+}
+
+function detectAccountType(headers: string[], metadata: Map<string, string>): AccountType {
+  const normalizedHeaders = headers.map(normalizeCell);
+
+  if (normalizedHeaders.includes("reference number") || metadata.has("card number")) {
+    return "credit_card";
+  }
+
+  const accountLabel = normalizeCell(metadata.get("account type") ?? metadata.get("account") ?? "");
+  if (accountLabel.includes("saving")) {
+    return "savings";
+  }
+
+  return "checking";
+}
+
+function detectAccountNumber(metadata: Map<string, string>): string {
+  return (
+    metadata.get("account number") ??
+    metadata.get("account #") ??
+    metadata.get("card number") ??
+    metadata.get("account") ??
+    ""
+  ).trim();
+}
+
+function detectAccountName(metadata: Map<string, string>, accountType: AccountType): string {
+  const explicitName = (metadata.get("account name") ?? metadata.get("account") ?? "").trim();
+  if (explicitName) {
+    return explicitName;
+  }
+
+  if (accountType === "credit_card") {
+    return "Credit card";
+  }
+
+  if (accountType === "savings") {
+    return "Savings";
+  }
+
+  return "Checking";
+}
+
+function buildAccountId(institution: Institution, accountType: AccountType, accountNumber: string): string {
+  const digitsOnly = accountNumber.replace(/\D/g, "");
+  if (digitsOnly) {
+    const suffix = digitsOnly.slice(-4);
+    return `${institution}-${accountType}-${suffix}`;
+  }
+
+  return `${institution}-${accountType}`;
+}
+
+function parseCsvPreview(csvText: string, filename: string): CsvPreview {
   const lines = csvText
     .replace(/\r/g, "")
     .split("\n")
@@ -82,6 +172,7 @@ function parseCsvPreview(csvText: string): CsvPreview {
   }
 
   const headerLineIndex = detectHeaderLineIndex(lines);
+  const linesBeforeHeader = lines.slice(0, headerLineIndex);
   const rawHeaders = parseCsvLine(lines[headerLineIndex]);
   const dataRows = lines.slice(headerLineIndex + 1).map(parseCsvLine);
   const maxColumns = Math.max(
@@ -98,26 +189,51 @@ function parseCsvPreview(csvText: string): CsvPreview {
     Array.from({ length: headers.length }, (_, index) => row[index] ?? ""),
   );
 
-  return { headers, rows };
+  const metadata = buildMetadataMap(linesBeforeHeader);
+  const institution = detectInstitution(csvText, filename, metadata);
+  const accountType = detectAccountType(headers, metadata);
+  const accountNumber = detectAccountNumber(metadata);
+
+  return {
+    headers,
+    rows,
+    detection: {
+      institution,
+      accountType,
+      accountId: buildAccountId(institution, accountType, accountNumber),
+      accountName: detectAccountName(metadata, accountType),
+    },
+  };
 }
 
 function runParserInlineTests() {
   const bofaLikeCsv = [
     "Account Number,123456789",
     "Statement Period,01/01/2026 - 01/31/2026",
-    "Beginning Balance,1000.00",
     "Date,Description,Amount,Running Bal.",
     "01/02/2026,COFFEE SHOP,-5.75,994.25",
     "01/03/2026,PAYROLL,1200.00,2194.25",
   ].join("\n");
 
-  const bofaPreview = parseCsvPreview(bofaLikeCsv);
+  const bofaPreview = parseCsvPreview(bofaLikeCsv, "boa-checking.csv");
   if (
     bofaPreview.headers[0] !== "Date" ||
     bofaPreview.headers[1] !== "Description" ||
-    bofaPreview.rows[0]?.[1] !== "COFFEE SHOP"
+    bofaPreview.rows[0]?.[1] !== "COFFEE SHOP" ||
+    bofaPreview.detection.accountType !== "checking" ||
+    bofaPreview.detection.accountId !== "boa-checking-6789"
   ) {
     throw new Error("Inline parser test failed for Date/Description/Amount");
+  }
+
+  const creditCardCsv = [
+    "Card Number,****1234",
+    "Date,Description,Amount,Reference Number",
+    "01/01/2026,ONLINE PURCHASE,-10.00,ABC123",
+  ].join("\n");
+  const creditCardPreview = parseCsvPreview(creditCardCsv, "boa-credit.csv");
+  if (creditCardPreview.detection.accountType !== "credit_card") {
+    throw new Error("Inline parser test failed for credit card detection");
   }
 
   const postedDateCsv = [
@@ -125,17 +241,18 @@ function runParserInlineTests() {
     "Posted Date,Payee,Amount",
     "02/01/2026,UTILITY BILL,-89.21",
   ].join("\n");
-  const postedDatePreview = parseCsvPreview(postedDateCsv);
+  const postedDatePreview = parseCsvPreview(postedDateCsv, "chase.csv");
   if (
     postedDatePreview.headers[0] !== "Posted Date" ||
-    postedDatePreview.headers[1] !== "Payee"
+    postedDatePreview.headers[1] !== "Payee" ||
+    postedDatePreview.detection.institution !== "chase"
   ) {
     throw new Error("Inline parser test failed for Posted Date/Payee/Amount");
   }
 
   let threwNoHeader = false;
   try {
-    parseCsvPreview("foo,bar\n1,2");
+    parseCsvPreview("foo,bar\n1,2", "bad.csv");
   } catch {
     threwNoHeader = true;
   }
@@ -166,7 +283,7 @@ export async function POST(request: Request) {
     }
 
     const text = await file.text();
-    const preview = parseCsvPreview(text);
+    const preview = parseCsvPreview(text, file.name);
 
     return NextResponse.json({
       ok: true,
@@ -175,6 +292,7 @@ export async function POST(request: Request) {
       headers: preview.headers,
       rows: preview.rows,
       rowCount: preview.rows.length,
+      detection: preview.detection,
     });
   } catch (error) {
     const message =
