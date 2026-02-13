@@ -1,5 +1,11 @@
 # CODEx Tasks (MVP)
 
+Requirement baseline:
+- Product requirements: `docs/PRD.md`
+- Technical specification: `docs/SPEC.md`
+- Any task acceptance criteria should be interpreted in alignment with these docs.
+
+
 ## 1. Upload page + upload API (multipart)
 Status: DONE
 
