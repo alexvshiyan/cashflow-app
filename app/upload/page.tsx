@@ -1,6 +1,7 @@
 "use client";
 
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { dedupeTransactions } from "@/app/lib/dedupe";
 
 type UploadResponse = {
   ok: true;
@@ -22,6 +23,7 @@ type Institution = "boa" | "chase";
 type AccountType = "checking" | "savings" | "credit_card";
 
 type CanonicalTransaction = {
+  userId: string;
   institution: Institution;
   source: "csv";
   accountType: AccountType;
@@ -43,6 +45,8 @@ const mappingFieldLabels: Record<MappingField, string> = {
 };
 
 const requiredMappingFields: MappingField[] = ["date", "amount", "description"];
+
+const IMPORTED_STORAGE_KEY = "cashflow-imported-transactions";
 
 function normalizeHeaderName(header: string): string {
   return header.trim().toLowerCase();
@@ -127,6 +131,12 @@ export default function UploadPage() {
     preview: CanonicalTransaction[];
   } | null>(null);
   const [normalizeError, setNormalizeError] = useState<string | null>(null);
+  const [normalizedTransactions, setNormalizedTransactions] = useState<CanonicalTransaction[]>([]);
+  const [importResult, setImportResult] = useState<{
+    imported_count: number;
+    skipped_duplicates_count: number;
+    total_persisted_count: number;
+  } | null>(null);
 
   const latestRequestRef = useRef(0);
   const formRef = useRef<HTMLFormElement>(null);
@@ -138,6 +148,8 @@ export default function UploadPage() {
     setPreview(null);
     setNormalizeResult(null);
     setNormalizeError(null);
+    setNormalizedTransactions([]);
+    setImportResult(null);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -148,6 +160,8 @@ export default function UploadPage() {
     setPreview(null);
     setNormalizeResult(null);
     setNormalizeError(null);
+    setNormalizedTransactions([]);
+    setImportResult(null);
     setIsSubmitting(true);
 
     try {
@@ -263,6 +277,8 @@ export default function UploadPage() {
     }
 
     setNormalizeError(null);
+    setNormalizedTransactions([]);
+    setImportResult(null);
 
     try {
       const dateIndex = preview.headers.indexOf(columnMapping.date);
@@ -310,6 +326,7 @@ export default function UploadPage() {
         const fingerprint = await sha256Hex(fingerprintInput);
 
         const tx: CanonicalTransaction = {
+          userId,
           institution: preview.detection.institution,
           source: "csv",
           accountType: preview.detection.accountType,
@@ -334,6 +351,7 @@ export default function UploadPage() {
         canonical.push(tx);
       }
 
+      setNormalizedTransactions(canonical);
       setNormalizeResult({
         normalized_count: canonical.length,
         skipped_invalid_count: skippedInvalidCount,
@@ -342,6 +360,26 @@ export default function UploadPage() {
     } catch {
       setNormalizeError("Normalization failed.");
     }
+  }
+
+  function handleImportDeduped() {
+    if (!normalizeResult || normalizedTransactions.length === 0) {
+      return;
+    }
+
+    const persistedRaw = window.localStorage.getItem(IMPORTED_STORAGE_KEY);
+    const persisted: CanonicalTransaction[] = persistedRaw ? JSON.parse(persistedRaw) : [];
+
+    const deduped = dedupeTransactions(normalizedTransactions, persisted);
+    const nextPersisted = [...persisted, ...deduped.imported];
+
+    window.localStorage.setItem(IMPORTED_STORAGE_KEY, JSON.stringify(nextPersisted));
+
+    setImportResult({
+      imported_count: deduped.imported_count,
+      skipped_duplicates_count: deduped.skipped_duplicates_count,
+      total_persisted_count: nextPersisted.length,
+    });
   }
 
   return (
@@ -504,6 +542,22 @@ export default function UploadPage() {
                 <li>normalized_count: {normalizeResult.normalized_count}</li>
                 <li>skipped_invalid_count: {normalizeResult.skipped_invalid_count}</li>
               </ul>
+              <button
+                type="button"
+                className="mt-3 rounded bg-black px-4 py-2 text-white"
+                onClick={handleImportDeduped}
+              >
+                Import deduped transactions
+              </button>
+
+              {importResult ? (
+                <ul className="mt-3 list-inside list-disc text-sm">
+                  <li>imported_count: {importResult.imported_count}</li>
+                  <li>skipped_duplicates_count: {importResult.skipped_duplicates_count}</li>
+                  <li>persisted_total: {importResult.total_persisted_count}</li>
+                </ul>
+              ) : null}
+
               <p className="mt-3 text-xs text-zinc-600">Canonical preview (first 10):</p>
               <pre className="mt-1 overflow-x-auto rounded bg-zinc-100 p-2 text-xs">
                 {JSON.stringify(normalizeResult.preview, null, 2)}
