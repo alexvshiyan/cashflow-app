@@ -1,6 +1,7 @@
 "use client";
 
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { dedupeTransactions } from "@/app/lib/dedupe";
 
 type UploadResponse = {
   ok: true;
@@ -9,16 +10,25 @@ type UploadResponse = {
   headers: string[];
   rows: string[][];
   rowCount: number;
+  detection: {
+    institution: Institution;
+    accountType: AccountType;
+    accountId: string;
+    accountName: string;
+  };
 };
 
-type MappingField = "date" | "amount" | "description" | "bankCategory";
+type MappingField = "date" | "amount" | "description" | "bankCategory" | "accountName";
 type Institution = "boa" | "chase";
 type AccountType = "checking" | "savings" | "credit_card";
 
 type CanonicalTransaction = {
+  userId: string;
   institution: Institution;
   source: "csv";
   accountType: AccountType;
+  accountId: string;
+  accountName: string;
   postedDateISO: string;
   amountNumber: number;
   description: string;
@@ -32,9 +42,12 @@ const mappingFieldLabels: Record<MappingField, string> = {
   amount: "Amount *",
   description: "Description / Payee *",
   bankCategory: "Category (optional)",
+  accountName: "Account name (optional)",
 };
 
 const requiredMappingFields: MappingField[] = ["date", "amount", "description"];
+
+const IMPORTED_STORAGE_KEY = "cashflow-imported-transactions";
 
 function normalizeHeaderName(header: string): string {
   return header.trim().toLowerCase();
@@ -90,6 +103,10 @@ function normalizeDescription(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+function isBeginningBalanceRow(description: string): boolean {
+  return /beginning\s+balance/i.test(description.trim());
+}
+
 async function sha256Hex(input: string): Promise<string> {
   const encoded = new TextEncoder().encode(input);
   const hashBuffer = await crypto.subtle.digest("SHA-256", encoded);
@@ -103,13 +120,12 @@ export default function UploadPage() {
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [selectedFileName, setSelectedFileName] = useState<string | null>(null);
-  const [institution, setInstitution] = useState<Institution>("boa");
-  const [accountType, setAccountType] = useState<AccountType>("checking");
   const [columnMapping, setColumnMapping] = useState<Record<MappingField, string>>({
     date: "",
     amount: "",
     description: "",
     bankCategory: "",
+    accountName: "",
   });
   const [normalizeResult, setNormalizeResult] = useState<{
     normalized_count: number;
@@ -117,6 +133,12 @@ export default function UploadPage() {
     preview: CanonicalTransaction[];
   } | null>(null);
   const [normalizeError, setNormalizeError] = useState<string | null>(null);
+  const [normalizedTransactions, setNormalizedTransactions] = useState<CanonicalTransaction[]>([]);
+  const [importResult, setImportResult] = useState<{
+    imported_count: number;
+    skipped_duplicates_count: number;
+    total_persisted_count: number;
+  } | null>(null);
 
   const latestRequestRef = useRef(0);
   const formRef = useRef<HTMLFormElement>(null);
@@ -128,6 +150,8 @@ export default function UploadPage() {
     setPreview(null);
     setNormalizeResult(null);
     setNormalizeError(null);
+    setNormalizedTransactions([]);
+    setImportResult(null);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -138,6 +162,8 @@ export default function UploadPage() {
     setPreview(null);
     setNormalizeResult(null);
     setNormalizeError(null);
+    setNormalizedTransactions([]);
+    setImportResult(null);
     setIsSubmitting(true);
 
     try {
@@ -179,6 +205,7 @@ export default function UploadPage() {
         amount: "",
         description: "",
         bankCategory: "",
+        accountName: "",
       });
       return;
     }
@@ -188,6 +215,7 @@ export default function UploadPage() {
       amount: guessColumn(preview.headers, ["amount", "amt", "debit", "credit"]),
       description: guessColumn(preview.headers, ["description", "payee", "memo", "merchant"]),
       bankCategory: guessColumn(preview.headers, ["category", "bankcategory", "type"]),
+      accountName: guessColumn(preview.headers, ["account name", "account", "card name"]),
     });
   }, [preview]);
 
@@ -216,6 +244,13 @@ export default function UploadPage() {
     preview.rows.forEach((row, rowIndex) => {
       const dateValue = row[dateIndex] ?? "";
       const amountValue = row[amountIndex] ?? "";
+      const descriptionIndex =
+        columnMapping.description.length > 0 ? preview.headers.indexOf(columnMapping.description) : -1;
+      const descriptionValue = descriptionIndex >= 0 ? (row[descriptionIndex] ?? "") : "";
+
+      if (isBeginningBalanceRow(descriptionValue)) {
+        return;
+      }
 
       if (!parseMDYDateToISO(dateValue)) {
         invalidDateRows.push(rowIndex + 1);
@@ -227,7 +262,7 @@ export default function UploadPage() {
     });
 
     return { invalidDateRows, invalidAmountRows };
-  }, [columnMapping.amount, columnMapping.date, preview]);
+  }, [columnMapping.amount, columnMapping.date, columnMapping.description, preview]);
 
   const mappingPayload = {
     required: {
@@ -237,6 +272,7 @@ export default function UploadPage() {
     },
     optional: {
       BankCategory: columnMapping.bankCategory,
+      AccountName: columnMapping.accountName,
     },
   };
 
@@ -246,6 +282,8 @@ export default function UploadPage() {
     }
 
     setNormalizeError(null);
+    setNormalizedTransactions([]);
+    setImportResult(null);
 
     try {
       const dateIndex = preview.headers.indexOf(columnMapping.date);
@@ -254,8 +292,11 @@ export default function UploadPage() {
       const categoryIndex = columnMapping.bankCategory
         ? preview.headers.indexOf(columnMapping.bankCategory)
         : -1;
+      const accountNameIndex = columnMapping.accountName
+        ? preview.headers.indexOf(columnMapping.accountName)
+        : -1;
       const sourceRefIndex =
-        institution === "boa" && accountType === "credit_card"
+        preview.detection.institution === "boa" && preview.detection.accountType === "credit_card"
           ? preview.headers.findIndex((header) => normalizeHeaderName(header) === "reference number")
           : -1;
 
@@ -265,7 +306,7 @@ export default function UploadPage() {
       }
 
       const userId = "mvp-user";
-      const accountId = `${institution}-${accountType}`;
+      const accountId = preview.detection.accountId;
 
       const canonical: CanonicalTransaction[] = [];
       let skippedInvalidCount = 0;
@@ -274,7 +315,7 @@ export default function UploadPage() {
         const amountRaw = row[amountIndex] ?? "";
         const descriptionRaw = (row[descriptionIndex] ?? "").trim();
 
-        if (!amountRaw.trim() || /beginning\s+balance/i.test(descriptionRaw)) {
+        if (!amountRaw.trim() || isBeginningBalanceRow(descriptionRaw)) {
           skippedInvalidCount += 1;
           continue;
         }
@@ -292,10 +333,15 @@ export default function UploadPage() {
           userId + accountId + postedDateISO + String(amountNumber) + normalizedDescription;
         const fingerprint = await sha256Hex(fingerprintInput);
 
+        const accountNameValue = accountNameIndex >= 0 ? (row[accountNameIndex] ?? "").trim() : "";
+
         const tx: CanonicalTransaction = {
-          institution,
+          userId,
+          institution: preview.detection.institution,
           source: "csv",
-          accountType,
+          accountType: preview.detection.accountType,
+          accountId: preview.detection.accountId,
+          accountName: accountNameValue || preview.detection.accountName,
           postedDateISO,
           amountNumber,
           description: descriptionRaw,
@@ -315,6 +361,7 @@ export default function UploadPage() {
         canonical.push(tx);
       }
 
+      setNormalizedTransactions(canonical);
       setNormalizeResult({
         normalized_count: canonical.length,
         skipped_invalid_count: skippedInvalidCount,
@@ -325,6 +372,26 @@ export default function UploadPage() {
     }
   }
 
+  function handleImportDeduped() {
+    if (!normalizeResult || normalizedTransactions.length === 0) {
+      return;
+    }
+
+    const persistedRaw = window.localStorage.getItem(IMPORTED_STORAGE_KEY);
+    const persisted: CanonicalTransaction[] = persistedRaw ? JSON.parse(persistedRaw) : [];
+
+    const deduped = dedupeTransactions(normalizedTransactions, persisted);
+    const nextPersisted = [...persisted, ...deduped.imported];
+
+    window.localStorage.setItem(IMPORTED_STORAGE_KEY, JSON.stringify(nextPersisted));
+
+    setImportResult({
+      imported_count: deduped.imported_count,
+      skipped_duplicates_count: deduped.skipped_duplicates_count,
+      total_persisted_count: nextPersisted.length,
+    });
+  }
+
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-2xl flex-col gap-6 p-6">
       <h1 className="text-2xl font-semibold">Upload CSV</h1>
@@ -333,29 +400,6 @@ export default function UploadPage() {
         onSubmit={handleSubmit}
         className="flex flex-col gap-4 rounded border p-4"
       >
-        <label className="flex flex-col gap-2">
-          <span className="text-sm">Institution</span>
-          <select
-            className="rounded border px-2 py-2"
-            value={institution}
-            onChange={(event) => setInstitution(event.target.value as Institution)}
-          >
-            <option value="boa">Bank of America</option>
-            <option value="chase">Chase</option>
-          </select>
-        </label>
-        <label className="flex flex-col gap-2">
-          <span className="text-sm">Account type</span>
-          <select
-            className="rounded border px-2 py-2"
-            value={accountType}
-            onChange={(event) => setAccountType(event.target.value as AccountType)}
-          >
-            <option value="checking">Checking</option>
-            <option value="savings">Savings</option>
-            <option value="credit_card">Credit card</option>
-          </select>
-        </label>
         <label className="flex flex-col gap-2">
           <span className="text-sm">CSV file</span>
           <input
@@ -393,6 +437,12 @@ export default function UploadPage() {
             File: {preview.filename} | Rows shown: {preview.rowCount}
           </p>
           <p className="text-sm">Detected headers: {preview.headers.join(", ")}</p>
+          <p className="text-sm text-zinc-700">
+            Auto-detected account: {preview.detection.accountName} ({preview.detection.accountType})
+          </p>
+          <p className="text-sm text-zinc-700">
+            Auto-detected IDs: institution={preview.detection.institution}, accountId={preview.detection.accountId}
+          </p>
           <div className="overflow-x-auto rounded border">
             <table className="min-w-full border-collapse text-sm">
               <thead>
@@ -502,6 +552,22 @@ export default function UploadPage() {
                 <li>normalized_count: {normalizeResult.normalized_count}</li>
                 <li>skipped_invalid_count: {normalizeResult.skipped_invalid_count}</li>
               </ul>
+              <button
+                type="button"
+                className="mt-3 rounded bg-black px-4 py-2 text-white"
+                onClick={handleImportDeduped}
+              >
+                Import deduped transactions
+              </button>
+
+              {importResult ? (
+                <ul className="mt-3 list-inside list-disc text-sm">
+                  <li>imported_count: {importResult.imported_count}</li>
+                  <li>skipped_duplicates_count: {importResult.skipped_duplicates_count}</li>
+                  <li>persisted_total: {importResult.total_persisted_count}</li>
+                </ul>
+              ) : null}
+
               <p className="mt-3 text-xs text-zinc-600">Canonical preview (first 10):</p>
               <pre className="mt-1 overflow-x-auto rounded bg-zinc-100 p-2 text-xs">
                 {JSON.stringify(normalizeResult.preview, null, 2)}
