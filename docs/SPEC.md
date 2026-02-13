@@ -14,15 +14,18 @@ This SPEC implements the product requirements in `docs/PRD.md`.
 
 ### 2.2 Transaction (canonical)
 - `id`
+- `userId` (MVP is single-user, but include in identity design for future multi-user)
 - `accountId`
 - `date` (normalized date)
 - `amount` (signed number)
 - `description`
 - `payee` (optional)
 - `categoryId` (optional)
-- `source`: `imported | planned | recurring | credit_plan`
+- `institution`: `boa | chase` (for imported CSV transactions)
+- `source`: `csv` (for imported CSV transactions)
+- `source_ref` (nullable string; use BoA credit-card `Reference Number` when available)
+- `fingerprint` (required string hash)
 - `recFlag` (see section 2.6)
-- `externalHash` / dedupe key (for imported rows)
 
 ### 2.3 PlannedTransaction
 - one-time future transaction
@@ -72,9 +75,18 @@ Recommended enum values:
 - Deterministic behavior for invalid rows (skip + capture reason or mark invalid queue).
 
 ### 3.4 Dedupe approach
-- Stable hash over normalized identity fields (at minimum date, normalized amount, normalized description/payee, account context).
-- Whitespace/case normalization rules must be deterministic.
+- Prefer source reference key when present: treat `(user_id, account_id, institution, source, source_ref)` as unique and skip duplicates on import.
+- Always compute fallback fingerprint as:
+  - `fingerprint = hash(user_id + account_id + posted_date + amount + normalized_description)`
+- Enforce fallback uniqueness on `(user_id, account_id, fingerprint)`.
+- Whitespace/case normalization for `normalized_description` must be deterministic.
 - Deduping should work within upload batch and against existing imported rows.
+- Apply DB-level unique constraints for both dedupe strategies.
+
+### 3.5 Import result stats
+- Import responses must include:
+  - `imported_count`
+  - `skipped_duplicates_count`
 
 ## 4) Forecast engine
 

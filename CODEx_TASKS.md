@@ -54,6 +54,7 @@ Status: TODO
 
 Acceptance Criteria:
 - A canonical in-memory `Transaction` model is defined and used consistently.
+- Canonical identity fields are present for imported rows: `institution` (`boa|chase`), `source` (`csv`), `source_ref` (nullable), `fingerprint` (required), and include `user_id` in identity design for future multi-user support.
 - Parsed CSV rows plus mapping config are transformed into canonical transactions.
 - Date and amount are normalized to predictable formats/types.
 - Missing required mapped values are handled deterministically (skip with reason, or collect validation errors).
@@ -62,18 +63,21 @@ Acceptance Criteria:
 Definition of Done:
 - Normalization function(s) produce canonical transaction objects from sample mapped input.
 - Edge cases (invalid date/amount, blank lines) are handled per documented behavior.
-- Output is consumable by downstream deduplication logic.
+- Output is consumable by downstream deduplication and dedupe-on-insert logic.
 
 ## 5. Implement deduplication strategy (hash key)
 Status: TODO
 
 Acceptance Criteria:
-- A deterministic hash key is generated per normalized transaction using stable fields.
-- Duplicate detection identifies repeated rows within a single upload batch.
-- Dedup result clearly marks kept vs duplicate transactions.
-- Hash logic is consistent regardless of row order and whitespace normalization.
+- Source-ref-first dedupe rule: if `source_ref` exists, treat `(user_id, account_id, institution, source, source_ref)` as unique and skip duplicates on insert/import.
+- A deterministic fingerprint is always generated using:
+  - `hash(user_id + account_id + posted_date + amount + normalized_description)`.
+- Fallback dedupe uniqueness is enforced on `(user_id, account_id, fingerprint)`.
+- Duplicate detection identifies repeated rows within a single upload batch and against persisted rows.
+- Import result returns stats: `imported_count` and `skipped_duplicates_count`.
+- DB-level unique constraints exist for both dedupe keys.
 
 Definition of Done:
-- Dedup module/function exists and is integrated after normalization.
-- At least one sample dataset with intentional duplicates confirms duplicates are detected.
-- Hash key construction and dedup behavior are documented in code comments or task notes.
+- Dedup module/function exists and is integrated after normalization with dedupe-on-insert behavior.
+- At least one sample dataset with intentional duplicates confirms duplicates are detected and skipped.
+- Hash key construction, unique constraints, and import stats behavior are documented in code comments or task notes.
