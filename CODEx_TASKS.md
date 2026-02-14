@@ -35,7 +35,7 @@ Definition of Done:
 - Error and empty states are handled and manually verified.
 
 ## 3. Column mapping UI
-Status: TODO
+Status: DONE
 
 Acceptance Criteria:
 - User can map CSV columns to required canonical fields: `Date`, `Amount`, `Description`, `BankCategory`.

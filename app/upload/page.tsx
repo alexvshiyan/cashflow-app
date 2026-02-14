@@ -18,7 +18,7 @@ type UploadResponse = {
   };
 };
 
-type MappingField = "date" | "amount" | "description" | "bankCategory";
+type MappingField = "date" | "amount" | "description" | "bankCategory" | "accountName";
 type Institution = "boa" | "chase";
 type AccountType = "checking" | "savings" | "credit_card";
 
@@ -42,6 +42,7 @@ const mappingFieldLabels: Record<MappingField, string> = {
   amount: "Amount *",
   description: "Description / Payee *",
   bankCategory: "Category (optional)",
+  accountName: "Account name (optional)",
 };
 
 const requiredMappingFields: MappingField[] = ["date", "amount", "description"];
@@ -124,6 +125,7 @@ export default function UploadPage() {
     amount: "",
     description: "",
     bankCategory: "",
+    accountName: "",
   });
   const [normalizeResult, setNormalizeResult] = useState<{
     normalized_count: number;
@@ -203,6 +205,7 @@ export default function UploadPage() {
         amount: "",
         description: "",
         bankCategory: "",
+        accountName: "",
       });
       return;
     }
@@ -212,6 +215,7 @@ export default function UploadPage() {
       amount: guessColumn(preview.headers, ["amount", "amt", "debit", "credit"]),
       description: guessColumn(preview.headers, ["description", "payee", "memo", "merchant"]),
       bankCategory: guessColumn(preview.headers, ["category", "bankcategory", "type"]),
+      accountName: guessColumn(preview.headers, ["account name", "account", "card name"]),
     });
   }, [preview]);
 
@@ -268,6 +272,7 @@ export default function UploadPage() {
     },
     optional: {
       BankCategory: columnMapping.bankCategory,
+      AccountName: columnMapping.accountName,
     },
   };
 
@@ -286,6 +291,9 @@ export default function UploadPage() {
       const descriptionIndex = preview.headers.indexOf(columnMapping.description);
       const categoryIndex = columnMapping.bankCategory
         ? preview.headers.indexOf(columnMapping.bankCategory)
+        : -1;
+      const accountNameIndex = columnMapping.accountName
+        ? preview.headers.indexOf(columnMapping.accountName)
         : -1;
       const sourceRefIndex =
         preview.detection.institution === "boa" && preview.detection.accountType === "credit_card"
@@ -325,13 +333,15 @@ export default function UploadPage() {
           userId + accountId + postedDateISO + String(amountNumber) + normalizedDescription;
         const fingerprint = await sha256Hex(fingerprintInput);
 
+        const accountNameValue = accountNameIndex >= 0 ? (row[accountNameIndex] ?? "").trim() : "";
+
         const tx: CanonicalTransaction = {
           userId,
           institution: preview.detection.institution,
           source: "csv",
           accountType: preview.detection.accountType,
           accountId: preview.detection.accountId,
-          accountName: preview.detection.accountName,
+          accountName: accountNameValue || preview.detection.accountName,
           postedDateISO,
           amountNumber,
           description: descriptionRaw,
